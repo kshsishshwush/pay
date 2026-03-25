@@ -1,0 +1,269 @@
+const express = require('express');
+const path = require('path');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+const fs = require('fs');
+const PUBLIC_DIR = path.join(__dirname, 'public');
+console.log('__dirname:', __dirname);
+console.log('PUBLIC_DIR:', PUBLIC_DIR);
+console.log('public exists:', fs.existsSync(PUBLIC_DIR));
+console.log('index.html exists:', fs.existsSync(path.join(PUBLIC_DIR, 'index.html')));
+// Если public не существует - раздаём из корня
+const STATIC_DIR = fs.existsSync(PUBLIC_DIR) ? PUBLIC_DIR : __dirname;
+console.log('Using STATIC_DIR:', STATIC_DIR);
+app.use(express.static(STATIC_DIR));
+
+// Supabase клиент
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+// ========== API РОУТЫ ==========
+
+// Создание сделки
+app.post('/api/deal', async (req, res) => {
+  try {
+    const { 
+      amount, 
+      bank, 
+      bankId,
+      bankLogo,
+      recipient, 
+      cardNumber, 
+      method, 
+      country,
+      currency,
+      currencySymbol,
+      details
+    } = req.body;
+    
+    // Валидация
+    if (!amount || !bank || !recipient || (!cardNumber && !details)) {
+      return res.status(400).json({ error: 'Все поля обязательны' });
+    }
+
+    // Используем токен от клиента если передан, иначе генерируем
+    let token = req.body.token;
+    if (!token || !token.startsWith('DEAL-')) {
+      const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      let randomPart1 = '';
+      let randomPart2 = '';
+      for (let i = 0; i < 6; i++) {
+        randomPart1 += characters.charAt(Math.floor(Math.random() * characters.length));
+        randomPart2 += characters.charAt(Math.floor(Math.random() * characters.length));
+      }
+      token = `DEAL-${randomPart1}-${randomPart2}`;
+    }
+    // Проверяем не существует ли уже такая сделка
+    const { data: existing } = await supabase.from('deals').select('token').eq('token', token).single();
+    if (existing) {
+      // Сделка уже есть — просто возвращаем её
+      return res.json({ success: true, link: '/' + token, token: token, deal: existing });
+    }
+
+    const { userLogin } = req.body;
+
+    // Сохранение в базу
+    const { data, error } = await supabase
+      .from('deals')
+      .insert([
+        {
+          token: token,
+          amount: amount,
+          bank: bank,
+          bank_id: bankId,
+          bank_logo: bankLogo,
+          recipient: recipient,
+          recipient_short: recipient.split(' ')[0] + ' ' + (recipient.split(' ')[1]?.[0] || '') + '.',
+          card_number: cardNumber,
+          details: details || cardNumber,
+          method: method || 'card',
+          country: country || 'russia',
+          currency: currency || 'RUB',
+          currency_symbol: currencySymbol || '₽',
+          status: 'active',
+          user_login: userLogin || null,
+          session_id: req.body.sessionId || null,
+          created_at: new Date().toISOString()
+        }
+      ])
+      .select();
+
+    if (error) {
+      console.error('Supabase error:', error);
+      return res.status(500).json({ error: 'Ошибка базы данных' });
+    }
+
+    // Возвращаем ссылку
+    res.json({
+      success: true,
+      link: `/deal/${token}`,
+      token: token,
+      deal: data[0]
+    });
+
+  } catch (error) {
+    console.error('Error creating deal:', error);
+    res.status(500).json({ error: 'Ошибка при создании сделки' });
+  }
+});
+
+// Получение сделки по токену
+app.get('/api/deal/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const tokenUpper = token.toUpperCase();
+
+    console.log('[GET /api/deal] Запрос сделки:', tokenUpper);
+
+    const { data, error } = await supabase
+      .from('deals')
+      .select('*')
+      .eq('token', tokenUpper)
+      .single();
+
+    if (error) {
+      console.error('[GET /api/deal] Supabase error:', error.message, '| token:', tokenUpper);
+      return res.status(404).json({ error: 'Сделка не найдена', detail: error.message });
+    }
+    if (!data) {
+      console.warn('[GET /api/deal] Сделка не найдена в БД:', tokenUpper);
+      return res.status(404).json({ error: 'Сделка не найдена' });
+    }
+
+    console.log('[GET /api/deal] Сделка найдена:', tokenUpper);
+    res.json(data);
+
+  } catch (error) {
+    console.error('[GET /api/deal] Exception:', error);
+    res.status(500).json({ error: 'Ошибка при получении сделки' });
+  }
+});
+
+// Получение всех сделок (без авторизации пока)
+app.get('/api/deals', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('deals')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) throw error;
+
+    res.json(data);
+
+  } catch (error) {
+    console.error('Error fetching deals:', error);
+    res.status(500).json({ error: 'Ошибка при получении сделок' });
+  }
+});
+
+// Получение сделок пользователя по userLogin (работает с любого устройства)
+app.get('/api/my-deals', async (req, res) => {
+  try {
+    const { sessionId, userLogin } = req.query;
+
+    let query = supabase.from('deals').select('*').order('created_at', { ascending: false }).limit(100);
+
+    if (userLogin) {
+      // Ищем по логину — работает с любого браузера/устройства
+      query = query.eq('user_login', userLogin);
+    } else if (sessionId) {
+      query = query.eq('session_id', sessionId);
+    } else {
+      return res.json([]);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+
+  } catch (error) {
+    console.error('Error fetching my deals:', error);
+    res.status(500).json({ error: 'Ошибка при получении сделок' });
+  }
+});
+
+// Обновление статуса сделки (оплата)
+app.patch('/api/deal/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { status, paymentData } = req.body;
+
+    const { data, error } = await supabase
+      .from('deals')
+      .update({ 
+        status: status,
+        payment_data: paymentData,
+        updated_at: new Date().toISOString()
+      })
+      .eq('token', token)
+      .select();
+
+    if (error) throw error;
+
+    res.json({ success: true, deal: data[0] });
+
+  } catch (error) {
+    console.error('Error updating deal:', error);
+    res.status(500).json({ error: 'Ошибка при обновлении сделки' });
+  }
+});
+
+// Удаление сделки
+app.delete('/api/deal/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const { error } = await supabase
+      .from('deals')
+      .delete()
+      .eq('token', token);
+
+    if (error) throw error;
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('Error deleting deal:', error);
+    res.status(500).json({ error: 'Ошибка при удалении сделки' });
+  }
+});
+
+// ========== ЯВНЫЕ SPA РОУТЫ ДЛЯ СДЕЛОК ==========
+// /deal/DEAL-XXX-XXX -> index.html (SPA обработает)
+app.get('/deal/:token', (req, res) => {
+  const indexFromPublic = path.join(__dirname, 'public', 'index.html');
+  const indexFromRoot   = path.join(__dirname, 'index.html');
+  const indexPath = fs.existsSync(indexFromPublic) ? indexFromPublic : indexFromRoot;
+  console.log('[SPA route /deal/:token]', req.params.token);
+  res.sendFile(indexPath);
+});
+
+// ========== FALLBACK ДЛЯ SPA ==========
+// Все остальные запросы (включая /DEAL-XXX-XXX) отдаем index.html
+app.get('*', (req, res) => {
+  const indexFromPublic = path.join(__dirname, 'public', 'index.html');
+  const indexFromRoot = path.join(__dirname, 'index.html');
+  const indexPath = fs.existsSync(indexFromPublic) ? indexFromPublic : indexFromRoot;
+  if (!fs.existsSync(indexPath)) {
+    return res.status(404).send('index.html not found at: ' + indexPath);
+  }
+  res.sendFile(indexPath);
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Supabase URL: ${process.env.SUPABASE_URL}`);
+});
