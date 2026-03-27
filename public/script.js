@@ -178,7 +178,7 @@ async function loadDealByToken(token) {
 
 // ========== РЕНДЕР СТРАНИЦЫ СДЕЛКИ ==========
 function renderDealView(deal) {
-    const methodText = deal.method === 'phone' ? 'номером телефона' :
+    const methodText = deal.method === 'phone' ? 'номеру телефона' :
                        deal.method === 'card'  ? 'номеру карты' : 'лицевому счёту';
     const methodIcon = deal.method === 'phone' ? '📱' :
                        deal.method === 'card'  ? '💳' : '📄';
